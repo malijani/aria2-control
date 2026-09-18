@@ -246,7 +246,7 @@ render_ui() {
 	out_buf+="${sep:0:$((term_cols - 1))}\033[K\n"
 
 	local header_cols
-	header_cols=$(printf "%-3s %-16s %-10s %-18s %-6s %-10s %s" " " "GID" "STATUS" "PROGRESS" "PERC" "SPEED" "FILE NAME")
+	header_cols=$(printf "%-3s %-16s %-10s %-18s %-6s %-19s %-10s %s" " " "GID" "STATUS" "PROGRESS" "PERC" "SIZE" "SPEED" "FILE NAME")
 	out_buf+="${header_cols:0:$((term_cols - 1))}\033[K\n"
 	out_buf+="${sep:0:$((term_cols - 1))}\033[K\n"
 
@@ -263,6 +263,12 @@ render_ui() {
 
 			filename=$(basename "$filepath")
 			[ -z "$filename" ] && filename="Unknown"
+
+			local completed_size total_size size_display
+			completed_size=$(format_bytes "$completed")
+			total_size=$(format_bytes "$total")
+
+			size_display="${completed_size} / ${total_size}"
 
 			local percent=0
 			if ((total > 0)); then
@@ -289,8 +295,15 @@ render_ui() {
 			fi
 
 			local formatted_row
-			formatted_row=$(printf "%s%-16s %-10s %-18s %3d%%   %-10s %s" \
-				"$prefix" "$gid" "${status^^}" "$bar" "$percent" "$(format_bytes "$speed")/s" "$filename")
+			formatted_row=$(printf "%s%-16s %-10s %-18s %3d%%   %-19s %-10s %s" \
+				"$prefix" \
+				"$gid" \
+				"${status^^}" \
+				"$bar" \
+				"$percent" \
+				"$size_display" \
+				"$(format_bytes "$speed")/s" \
+				"$filename")
 
 			out_buf+="${format_style}${formatted_row:0:$((term_cols - 1))}\033[0m\033[K\n"
 
