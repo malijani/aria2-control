@@ -43,8 +43,8 @@ sudo pacman -S aria2 curl jq ncurses
 ### 1. Clone the repository
 
 ```bash
-git clone <repository-url>
-cd <repository-directory>
+git clone https://github.com/malijani/aria2-control
+cd aria2-control
 ```
 
 ### 2. Make the script executable
