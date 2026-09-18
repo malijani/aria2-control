@@ -39,7 +39,7 @@ WantedBy=default.target
 EOF
 
 	echo "[+] Writing configuration to $CONF_PATH..."
-	cat <<'EOF' >"$CONF_PATH"
+	cat <<EOF >"$CONF_PATH"
 enable-rpc=true
 rpc-listen-all=false
 rpc-allow-origin-all=true
