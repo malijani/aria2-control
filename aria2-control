@@ -108,7 +108,7 @@ service_restart() {
 # ==============================================================================
 
 check_dependencies() {
-	for cmd in curl jq tput; do
+	for cmd in curl jq tput aria2; do
 		if ! command -v "$cmd" >/dev/null 2>&1; then
 			echo "Error: Required command '$cmd' is not installed." >&2
 			exit 1
