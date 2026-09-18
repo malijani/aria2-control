@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+
+# ==============================================================================
+# Aria2 Control -TUI + Systemd management
+# ==============================================================================
+
+SERVICE_NAME="aria2.service"
+SERVICE_PATH="$HOME/.config/systemd/user/$SERVICE_NAME"
+CONF_DIR="$HOME/.aria2"
+CONF_PATH="$CONF_DIR/aria2.conf"
+DOWNLOAD_PATH="$HOME/Downloads"
+
+RPC_URL="${ARIA2_RPC_URL:-http://localhost:6800/jsonrpc}"
+SECRET="${ARIA2_RPC_SECRET:-}"
+REFRESH_RATE=1.0
+
+SELECTED_INDEX=0
+TOTAL_ITEMS=0
+STATUS_MSG="Ready. Press 'h' for help."
+
+# ==============================================================================
+# Systemd Service Management
+# ==============================================================================
+install_service() {
+	echo "[+] Creating directories..."
+	mkdir -p "$HOME/.config/systemd/user" "$CONF_DIR" "$DOWNLOAD_PATH"
+
+	echo "[+] Writing systemd user unit to $SERVICE_PATH..."
+	cat <<'EOF' >"$SERVICE_PATH"
+[Unit]
+Description=Aria2 Downloader Daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/aria2c --conf-path=%h/.aria2/aria2.conf
+
+[Install]
+WantedBy=default.target
+EOF
+
+	echo "[+] Writing configuration to $CONF_PATH..."
+	cat <<'EOF' >"$CONF_PATH"
+enable-rpc=true
+rpc-listen-all=false
+rpc-allow-origin-all=true
+rpc-listen-port=6800
+
+# Default download directory 
+dir=$DOWNLOAD_PATH
+
+# Connection settings
+max-connection-per-server=16
+split=16
+
+# Segment size
+min-split-size=1M
+
+# Piece size
+piece-length=1M
+
+# File handling
+file-allocation=none
+continue=true
+
+# Retry behavior
+retry-wait=5
+max-tries=10
+
+# Output behavior
+summary-interval=1
+save-session-interval=30
+
+check-certificate=false
+
+log-level=info
+console-log-level=notice
+log=$HOME/aria2.log
+EOF
+
+	echo "[+] Reloading systemd user daemon and enabling service..."
+	systemctl --user daemon-reload
+	systemctl --user enable --now "$SERVICE_NAME"
+
+	echo "[✓] Installation complete! Aria2 service is now active and enabled."
+}
+
+service_status() {
+	systemctl --user status "$SERVICE_NAME"
+}
+
+service_start() {
+	systemctl --user start "$SERVICE_NAME"
+	echo "[✓] Aria2 service started."
+}
+
+service_stop() {
+	systemctl --user stop "$SERVICE_NAME"
+	echo "[✓] Aria2 service stopped."
+}
+
+service_restart() {
+	systemctl --user restart "$SERVICE_NAME"
+	echo "[✓] Aria2 service restarted."
+}
+
+# ==============================================================================
+# Interactive TUI Dashboard
+# ==============================================================================
+
+check_dependencies() {
+	for cmd in curl jq tput; do
+		if ! command -v "$cmd" >/dev/null 2>&1; then
+			echo "Error: Required command '$cmd' is not installed." >&2
+			exit 1
+		fi
+	done
+}
+
+rpc_call() {
+	local method="$1"
+	local params="$2"
+	local json_payload
+
+	if [[ -n "$SECRET" ]]; then
+		if [[ -z "$params" || "$params" == "[]" ]]; then
+			params="[\"token:$SECRET\"]"
+		else
+			params="[\"token:$SECRET\", ${params#[}}"
+		fi
+	fi
+
+	json_payload="{\"jsonrpc\":\"2.0\",\"id\":\"aria2_tui\",\"method\":\"$method\"${params:+, \"params\":$params}}"
+	curl -s -m 2 -X POST -H "Content-Type: application/json" -d "$json_payload" "$RPC_URL" 2>/dev/null
+}
+
+cleanup() {
+	printf "\033[?25h\033[?1049l"
+	stty echo icanon
+	echo "Exited Aria2 TUI Controller."
+	exit 0
+}
+
+format_bytes() {
+	local bytes=${1:-0}
+	if ((bytes < 1024)); then
+		echo "${bytes} B"
+	elif ((bytes < 1048576)); then
+		echo "$(awk "BEGIN {printf \"%.2f\", $bytes/1024}") KB"
+	elif ((bytes < 1073741824)); then
+		echo "$(awk "BEGIN {printf \"%.2f\", $bytes/1048576}") MB"
+	else
+		echo "$(awk "BEGIN {printf \"%.2f\", $bytes/1073741824}") GB"
+	fi
+}
+
+draw_progress_bar() {
+	local percent=$1
+	local width=15
+	local filled=$((percent * width / 100))
+	local empty=$((width - filled))
+	local bar=""
+
+	for ((i = 0; i < filled; i++)); do bar+="="; done
+	if ((filled < width)); then
+		bar+=">"
+		((empty--))
+	fi
+	for ((i = 0; i < empty; i++)); do bar+=" "; done
+	echo "[$bar]"
+}
+
+fetch_all_tasks() {
+	local token_param=""
+	if [[ -n "$SECRET" ]]; then
+		token_param="\"token:$SECRET\", "
+	fi
+
+	local keys='["gid", "status", "completedLength", "totalLength", "downloadSpeed", "files", "errorMessage"]'
+	local payload=$(
+		cat <<EOF
+{
+  "jsonrpc": "2.0",
+  "id": "multicall",
+  "method": "system.multicall",
+  "params": [[
+    {"methodName": "aria2.tellActive", "params": [${token_param}${keys}]},
+    {"methodName": "aria2.tellWaiting", "params": [${token_param}0, 100, ${keys}]},
+    {"methodName": "aria2.tellStopped", "params": [${token_param}0, 100, ${keys}]}
+  ]]
+}
+EOF
+	)
+
+	local raw_resp
+	raw_resp=$(curl -s -m 2 -X POST -H "Content-Type: application/json" -d "$payload" "$RPC_URL" 2>/dev/null)
+
+	if [[ -z "$raw_resp" ]]; then
+		echo "[]"
+		return
+	fi
+
+	echo "$raw_resp" | jq -c '[ .result[][0] // [] ] | add' 2>/dev/null || echo "[]"
+}
+
+render_ui() {
+	local tasks_json="$1"
+	local term_cols term_rows
+	term_cols=$(tput cols)
+	term_rows=$(tput lines)
+
+	TOTAL_ITEMS=$(echo "$tasks_json" | jq 'length')
+
+	if ((TOTAL_ITEMS == 0)); then
+		SELECTED_INDEX=0
+	elif ((SELECTED_INDEX >= TOTAL_ITEMS)); then
+		SELECTED_INDEX=$((TOTAL_ITEMS - 1))
+	fi
+
+	local out_buf="\033[H"
+
+	out_buf+="\033[K\n\033[K\n"
+
+	local a1=" █████╗ ██████╗ ██╗ █████╗ ██████╗   ██████╗ ██████╗ ███╗   ██╗████████╗██████╗  ██████╗ ██╗     "
+	local a2="██╔══██╗██╔══██╗██║██╔══██╗╚════██╗ ██╔════╝██╔═══██╗████╗  ██║╚══██╔══╝██╔══██╗██╔═══██╗██║     "
+	local a3="███████║██████╔╝██║███████║ █████╔╝ ██║     ██║   ██║██╔██╗ ██║   ██║   ██████╔╝██║   ██║██║     "
+	local a4="██╔══██║██╔══██╗██║██╔══██║██╔═══╝  ██║     ██║   ██║██║╚██╗██║   ██║   ██╔══██╗██║   ██║██║     "
+	local a5="██║  ██║██║  ██║██║██║  ██║███████╗ ╚██████╗╚██████╔╝██║ ╚████║   ██║   ██║  ██║╚██████╔╝███████╗"
+
+	local art_w=97
+	local pad=0
+	if ((term_cols > art_w)); then
+		pad=$(((term_cols - art_w) / 2))
+	fi
+	local pad_str=""
+	if ((pad > 0)); then
+		pad_str=$(printf '%*s' "$pad" '')
+	fi
+
+	out_buf+="\033[1;36m${pad_str}${a1}\033[0m\033[K\n"
+	out_buf+="\033[1;36m${pad_str}${a2}\033[0m\033[K\n"
+	out_buf+="\033[1;36m${pad_str}${a3}\033[0m\033[K\n"
+	out_buf+="\033[1;36m${pad_str}${a4}\033[0m\033[K\n"
+	out_buf+="\033[1;36m${pad_str}${a5}\033[0m\033[K\n"
+
+	local sep="------------------------------------------------------------------------------------------------------------------------"
+	out_buf+="${sep:0:$((term_cols - 1))}\033[K\n"
+
+	local header_cols
+	header_cols=$(printf "%-3s %-16s %-10s %-18s %-6s %-10s %s" " " "GID" "STATUS" "PROGRESS" "PERC" "SPEED" "FILE NAME")
+	out_buf+="${header_cols:0:$((term_cols - 1))}\033[K\n"
+	out_buf+="${sep:0:$((term_cols - 1))}\033[K\n"
+
+	local current_line=10
+	local max_visible_items=$((term_rows - 14))
+
+	if ((TOTAL_ITEMS == 0)); then
+		out_buf+="\033[33m No downloads found.\033[0m\033[K\n"
+		((current_line++))
+	else
+		local idx=0
+		while IFS=$'\t' read -r gid status completed total speed filepath; do
+			[[ -z "$gid" ]] && continue
+
+			filename=$(basename "$filepath")
+			[ -z "$filename" ] && filename="Unknown"
+
+			local percent=0
+			if ((total > 0)); then
+				percent=$((completed * 100 / total))
+			fi
+
+			local bar
+			bar=$(draw_progress_bar "$percent")
+
+			local color_code=37
+			case "$status" in
+			active) color_code=32 ;;   # Green
+			paused) color_code=33 ;;   # Yellow
+			complete) color_code=34 ;; # Blue
+			error) color_code=31 ;;    # Red
+			waiting) color_code=35 ;;  # Magenta
+			esac
+
+			local prefix="  "
+			local format_style="\033[${color_code}m"
+			if ((idx == SELECTED_INDEX)); then
+				prefix="> "
+				format_style="\033[7;${color_code}m"
+			fi
+
+			local formatted_row
+			formatted_row=$(printf "%s%-16s %-10s %-18s %3d%%   %-10s %s" \
+				"$prefix" "$gid" "${status^^}" "$bar" "$percent" "$(format_bytes "$speed")/s" "$filename")
+
+			out_buf+="${format_style}${formatted_row:0:$((term_cols - 1))}\033[0m\033[K\n"
+
+			((idx++))
+			((current_line++))
+			if ((idx >= max_visible_items)); then break; fi
+		done < <(echo "$tasks_json" | jq -r '.[] | [
+            .gid,
+            .status,
+            (.completedLength // "0"),
+            (.totalLength // "0"),
+            (.downloadSpeed // "0"),
+            (.files[0].path // .files[0].uris[0].uri // "Unknown")
+        ] | @tsv')
+	fi
+
+	while ((current_line < term_rows - 4)); do
+		out_buf+="\033[K\n"
+		((current_line++))
+	done
+
+	out_buf+="${sep:0:$((term_cols - 1))}\033[K\n"
+	out_buf+="\033[32mKeybindings: [a] Add [p] Pause [r] Resume [R] Restart [d] Delete [c] Clear\033[0m\033[K\n"
+	out_buf+="\033[32m             [P] Pause All [U] Resume All [Up/Down or j/k] Nav [q] Quit\033[0m\033[K\n"
+	out_buf+="\033[36mStatus: ${STATUS_MSG:0:$((term_cols - 10))}\033[0m\033[K\n"
+
+	printf "%b" "$out_buf"
+}
+
+action_add_url() {
+	printf "\033[?25h"
+	tput cup $(($(tput lines) - 1)) 0
+	tput el
+	echo ""
+	read -rp "Enter Download URL: " url_input
+	printf "\033[?25l"
+	if [[ -n "$url_input" ]]; then
+		local res
+		res=$(rpc_call "aria2.addUri" "[[\"$url_input\"]]")
+		if echo "$res" | grep -q "result"; then
+			STATUS_MSG="Successfully added download task."
+		else
+			STATUS_MSG="Error adding download."
+		fi
+	fi
+}
+
+action_pause() {
+	local gid="$1"
+	[[ -z "$gid" ]] && return
+	rpc_call "aria2.pause" "[\"$gid\"]" >/dev/null
+	STATUS_MSG="Paused GID: $gid"
+}
+
+action_resume() {
+	local gid="$1"
+	[[ -z "$gid" ]] && return
+	local res
+	res=$(rpc_call "aria2.unpause" "[\"$gid\"]")
+	if echo "$res" | grep -q "error"; then
+		action_restart "$gid"
+	else
+		STATUS_MSG="Resumed GID: $gid"
+	fi
+}
+
+action_delete() {
+	local gid="$1"
+	[[ -z "$gid" ]] && return
+	local res
+	res=$(rpc_call "aria2.remove" "[\"$gid\"]")
+	if echo "$res" | grep -q "error"; then
+		rpc_call "aria2.removeDownloadResult" "[\"$gid\"]" >/dev/null
+	fi
+	STATUS_MSG="Removed GID: $gid"
+}
+
+action_restart() {
+	local gid="$1"
+	[[ -z "$gid" ]] && return
+
+	local file_json uri new_gid
+	file_json=$(rpc_call "aria2.getFiles" "[\"$gid\"]")
+	uri=$(echo "$file_json" | jq -r '.result[0].uris[0].uri // empty')
+
+	if [[ -z "$uri" ]]; then
+		STATUS_MSG="Failed to extract source URI for GID: $gid"
+		return
+	fi
+
+	new_gid=$(rpc_call "aria2.addUri" "[[\"$uri\"]]")
+	local new_id
+	new_id=$(echo "$new_gid" | jq -r '.result // empty')
+
+	rpc_call "aria2.removeDownloadResult" "[\"$gid\"]" >/dev/null
+	STATUS_MSG="Restarted task! New GID: $new_id"
+}
+
+run_tui() {
+	check_dependencies
+	trap cleanup EXIT INT TERM
+	stty -echo -icanon min 0 time 0
+	printf "\033[?1049h\033[?25l"
+	clear
+
+	while true; do
+		local tasks_json
+		tasks_json=$(fetch_all_tasks)
+		render_ui "$tasks_json"
+
+		local key=""
+		read -rsn1 -t "$REFRESH_RATE" key
+
+		if [[ "$key" == $'\x1b' ]]; then
+			read -rsn2 -t 0.05 key_seq
+			key+="$key_seq"
+		fi
+
+		local sel_gid=""
+		if ((TOTAL_ITEMS > 0)); then
+			sel_gid=$(echo "$tasks_json" | jq -r ".[$SELECTED_INDEX].gid // empty")
+		fi
+
+		case "$key" in
+		$'\x1b[A' | k)
+			if ((SELECTED_INDEX > 0)); then ((SELECTED_INDEX--)); fi
+			;;
+		$'\x1b[B' | j)
+			if ((SELECTED_INDEX < TOTAL_ITEMS - 1)); then ((SELECTED_INDEX++)); fi
+			;;
+		a | A) action_add_url ;;
+		p) action_pause "$sel_gid" ;;
+		r) action_resume "$sel_gid" ;;
+		R) action_restart "$sel_gid" ;;
+		d | x) action_delete "$sel_gid" ;;
+		c)
+			rpc_call "aria2.purgeDownloadResult" >/dev/null
+			STATUS_MSG="Purged completed and failed downloads."
+			;;
+		P)
+			rpc_call "aria2.pauseAll" >/dev/null
+			STATUS_MSG="Paused all tasks."
+			;;
+		U)
+			rpc_call "aria2.unpauseAll" >/dev/null
+			STATUS_MSG="Resumed all tasks."
+			;;
+		h | H)
+			STATUS_MSG="Keys: [a]Add [p]Pause [r]Resume [R]Restart [d]Delete [c]Clear [q]Quit"
+			;;
+		q | Q)
+			break
+			;;
+		esac
+	done
+}
+
+# ==============================================================================
+# Script Command Dispatcher
+# ==============================================================================
+
+case "$1" in
+install)
+	install_service
+	;;
+status)
+	service_status
+	;;
+start)
+	service_start
+	;;
+stop)
+	service_stop
+	;;
+restart)
+	service_restart
+	;;
+tui | "")
+	run_tui
+	;;
+*)
+	echo "Usage: $0 {install|status|start|stop|restart}"
+	echo "Running without arguments starts the interactive TUI."
+	exit 1
+	;;
+esac

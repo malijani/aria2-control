@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 280px; font-family: sans-serif; padding: 10px; margin: 0; }
+    .row { margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+    label { font-weight: bold; font-size: 13px; }
+    input[type="text"] { width: 100%; padding: 6px; box-sizing: border-box; margin-top: 4px; }
+    .toggle-btn { padding: 6px 12px; border: none; cursor: pointer; color: white; font-weight: bold; border-radius: 4px; }
+    .enabled { background: #2ecc71; }
+    .disabled { background: #e74c3c; }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <label>Extension Status:</label>
+    <button id="toggleStatus" class="toggle-btn enabled">ENABLED</button>
+  </div>
+  <div>
+    <label>Download Directory:</label>
+    <input type="text" id="downloadDir" value="/home/YOUR_USERNAME/Downloads">
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
